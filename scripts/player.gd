@@ -1,23 +1,25 @@
 extends CharacterBody3D
 
-# --- CONTROL Y ESTADOS ---
+# Player control and state.
 @export var is_player_controlled: bool = false
 enum PlayerState { USER_CONTROL, SUPPORT_ATTACK, DEFEND, WAIT_FOR_PASS }
 var current_state: PlayerState = PlayerState.SUPPORT_ATTACK
 
-# --- MOVIMIENTO ---
+# Movement settings.
 @export var based_speed: float = 10.0
 @export var speed_with_ball: float = 15.0
-@export var push_force: float = 3.0
 const JUMP_VELOCITY = 4.5
 
-# --- BALÓN Y CONDUCCIÓN ---
+# Ball possession and dribbling.
 @export var dribble_speed: float = 25.0
 @export var max_dribble_distance: float = 2.5
+@export var ball_pickup_radius: float = 1.6
 @onready var dribble_pos: Marker3D = $DribblePos
 var ball: RigidBody3D = null
+var pickup_lockout: float = 0.0
+var receive_direction: Vector3 = Vector3.ZERO
 
-# --- DISPARO Y PASE ---
+# Shooting and passing.
 @export var min_kick_force: float = 25.0
 @export var max_kick_force: float = 50.0
 @export var min_kick_up_force: float = 1.0
@@ -29,10 +31,11 @@ var is_charging: bool = false
 @export var pass_force: float = 20.0
 @export var max_pass_angle: float = 45.0
 
-# --- IA (ZONAS Y SEPARACIÓN) ---
+# Teammate AI settings.
 @export var ai_speed: float = 8.0
-@export var zone_radius: float = 8.0     # Qué tanto pueden alejarse de su posición original
-@export var personal_space: float = 2.5  # El radio que nadie más puede pisar
+@export var personal_space: float = 2.5  # Minimum space between teammates.
+@export var support_distance: float = 5.0
+@export var lane_follow: float = 0.4
 var initial_position: Vector3
 
 func _ready() -> void:
@@ -43,20 +46,17 @@ func _ready() -> void:
 		current_state = PlayerState.SUPPORT_ATTACK
 
 func _physics_process(delta: float) -> void:
-
+	pickup_lockout = maxf(pickup_lockout - delta, 0.0)
 
 	var direction = Vector3.ZERO
 
-	#Indicador visual de a quien controla el jugador
+	# Show which player is controlled.
 	$Indicator.visible = is_player_controlled
 
 	if not is_on_floor():
 		velocity += get_gravity() * delta
 
-	if not is_on_floor():
-		velocity += get_gravity() * delta
-
-	# --- MÁQUINA DE ESTADOS ---
+	# Handle the current player state.
 	match current_state:
 		PlayerState.USER_CONTROL:
 			var input_dir = Input.get_vector("left", "right", "forward", "back")
@@ -65,7 +65,7 @@ func _physics_process(delta: float) -> void:
 			if Input.is_action_just_pressed("ui_accept") and is_on_floor() and not is_charging:
 				velocity.y = JUMP_VELOCITY
 
-			#Cambio manual si no tenemos el balon
+			# Allow switching players when not holding the ball.
 			if ball == null and Input.is_action_just_pressed("switch_player"):
 				manual_switch()
 				
@@ -78,24 +78,51 @@ func _physics_process(delta: float) -> void:
 				
 				var teammates = get_tree().get_nodes_in_group("team_player")
 				
-				# Verificar si ALGUIEN del equipo ya tiene el balón controlado
+				# Check whether a teammate already has the ball.
 				var team_has_ball = false
 				for t in teammates:
 					if t.ball != null:
 						team_has_ball = true
 						break
 				
-				# 1. FUERZA DE FORMACIÓN (CORREGIDA PARA TU CANCHA)
-				# El Eje X es el largo (ataque/defensa). El Eje Z es el ancho (carril).
-				# initial_position.x * 0.5 asegura que los delanteros se adelanten y los defensas se queden atrás
-				var target_x = game_ball.global_position.x + (initial_position.x * 0.5)
-				var formation_target = Vector3(target_x, global_position.y, initial_position.z)
-				var vector_to_formation = formation_target - global_position
+				# Shift the home position with the ball while keeping each player's lane.
+				var ball_offset = game_ball.global_position - Vector3(initial_position.x, game_ball.global_position.y, initial_position.z)
+				var formation_target = Vector3(
+					initial_position.x + ball_offset.x * 0.65,
+					global_position.y,
+					initial_position.z + ball_offset.z * lane_follow
+				)
+				var support_target = formation_target
+
+				# Rank AI teammates by their starting position along the attack direction.
+				var attack_direction = sign(initial_position.x)
+				var teammates_ahead = 0
+				for teammate in teammates:
+					if teammate == self or teammate.is_player_controlled:
+						continue
+					if (teammate.initial_position.x - initial_position.x) * attack_direction > 0.0:
+						teammates_ahead += 1
+
+				# The two most advanced AI players move forward; the others stay behind.
+				if team_has_ball:
+					if teammates_ahead < 2:
+						var forward_target_x = game_ball.global_position.x + attack_direction * support_distance
+						if attack_direction > 0.0:
+							support_target.x = maxf(support_target.x, forward_target_x)
+						else:
+							support_target.x = minf(support_target.x, forward_target_x)
+					else:
+						var defensive_target_x = game_ball.global_position.x - attack_direction * support_distance
+						if attack_direction > 0.0:
+							support_target.x = minf(support_target.x, defensive_target_x)
+						else:
+							support_target.x = maxf(support_target.x, defensive_target_x)
+
+				var vector_to_support = support_target - global_position
+				if vector_to_support.length() > 0.5:
+					steering += vector_to_support.normalized() * minf(vector_to_support.length() / 4.0, 1.5)
 				
-				if vector_to_formation.length() > 0.5:
-					steering += vector_to_formation.normalized() * 1.0 
-				
-				# 2. FUERZA "ON DUTY" (Ir por el balón solo si está suelto)
+				# The closest teammate chases the ball when nobody has it.
 				if not team_has_ball:
 					var dist_to_ball = global_position.distance_to(game_ball.global_position)
 					var am_i_closest = true
@@ -108,26 +135,25 @@ func _physics_process(delta: float) -> void:
 					
 					if am_i_closest:
 						var seek_force = (game_ball.global_position - global_position).normalized()
-						# Peso de 2.5 para que la urgencia del balón rompa la formación
+						# Prioritize chasing the ball over keeping formation.
 						steering += seek_force * 2.5 
 				
 				
-			# 3. FUERZA DE SEPARACIÓN (Corregida para que actúe como un imán suave)
+			# Keep teammates from crowding each other.
 				var separation = Vector3.ZERO
 				for t in teammates:
 					if t != self:
 						var dist = global_position.distance_to(t.global_position)
 						if dist < personal_space and dist > 0.1:
-							# Cambiamos '/ dist' por '* (personal_space - dist)'
-							# Esto hace que la fuerza se desvanezca a CERO suavemente antes de chocar
+
 							separation += (global_position - t.global_position).normalized() * (personal_space - dist)
 							
 				steering += separation * 4.0 
 				
-				# --- APLICAR LA SUMA TOTAL DE FUERZAS ---
+				# Combine the steering forces into movement.
 				steering.y = 0 
 				if steering.length() > 0.1:
-					# Si el empuje es pequeño, caminan despacio. Si es muy grande, se limitan a correr (1.0)
+
 					if steering.length() > 1.0:
 						direction = steering.normalized()
 					else:
@@ -137,50 +163,59 @@ func _physics_process(delta: float) -> void:
 			direction = Vector3.ZERO
 			is_charging = false
 
-	# Detener movimiento si estamos cargando un tiro
+	# Stop moving while charging a shot.
 	if is_charging:
 		direction = Vector3.ZERO
 
-	# Calcular velocidad actual
+	# Choose a speed based on control and possession.
 	var current_speed = based_speed
 	if current_state != PlayerState.USER_CONTROL:
 		current_speed = ai_speed
 	elif ball != null:
 		current_speed = speed_with_ball
 
-	# --- APLICAR MOVIMIENTO Y ROTACIÓN (SIN TEMBLORES) ---
+	# Apply smooth movement and face the travel direction.
 	if direction != Vector3.ZERO:
-		# Usamos "lerpf" para acelerar de forma suave y humana, evitando tirones robóticos
+
 		velocity.x = lerpf(velocity.x, direction.x * current_speed, 10.0 * delta)
 		velocity.z = lerpf(velocity.z, direction.z * current_speed, 10.0 * delta)
 		
-		# SOLO rotamos la mirada si el jugador realmente se está moviendo con fuerza
-		# (Esto es lo que elimina que tiemblen cuando están casi parados)
+
 		var move_intensity = Vector2(velocity.x, velocity.z).length()
 		if move_intensity > 0.5:
 			look_at(global_position + direction, Vector3.UP)
 	else:
-		# Frenado suave (derrape ligero)
+		# Slow down smoothly when there is no movement input.
 		velocity.x = lerpf(velocity.x, 0, 15.0 * delta)
 		velocity.z = lerpf(velocity.z, 0, 15.0 * delta)
 
-	
 
 	move_and_slide()
 
-	# --- COLISIONES Y CAMBIO DE JUGADOR AUTOMÁTICO ---
+	# Pick up the ball on contact and activate this player.
 	for i in get_slide_collision_count():
 		var collision = get_slide_collision(i)
 		var collider = collision.get_collider()
 
 		if collider is RigidBody3D and ball == null:
-			ball = collider
-			add_collision_exception_with(ball)
-			
-			if current_state == PlayerState.WAIT_FOR_PASS or current_state == PlayerState.SUPPORT_ATTACK:
-				become_active_player()
+			claim_ball(collider)
 
-	# --- CONDUCCIÓN, PASE Y DISPARO ---
+	# Catch the ball by proximity if slide collision did not report it.
+	if ball == null and pickup_lockout <= 0.0:
+		var ball_nodes = get_tree().get_nodes_in_group("game_ball")
+		if ball_nodes.size() > 0:
+			var loose_ball = ball_nodes[0] as RigidBody3D
+			var ball_is_held = false
+			for teammate in get_tree().get_nodes_in_group("team_player"):
+				if teammate.ball == loose_ball:
+					ball_is_held = true
+					break
+
+			# Only collect a loose ball that has reached this player's catch radius.
+			if not ball_is_held and global_position.distance_to(loose_ball.global_position) <= ball_pickup_radius:
+				claim_ball(loose_ball)
+
+	# Dribble, pass, or shoot while holding the ball.
 	if ball:
 		var dist = global_position.distance_to(ball.global_position)
 
@@ -191,9 +226,10 @@ func _physics_process(delta: float) -> void:
 			charge_time = 0.0
 		else:
 			if current_state == PlayerState.USER_CONTROL:
-				if Input.is_physical_key_pressed(KEY_F):
+				# Pass once per key press so a receiver cannot pass again from a held key.
+				if Input.is_action_just_pressed("pass"):
 					pass_ball()
-				elif Input.is_physical_key_pressed(KEY_E):
+				elif Input.is_action_pressed("shoot"):
 					is_charging = true
 					charge_time += delta
 					if charge_time > max_charge_time:
@@ -203,7 +239,7 @@ func _physics_process(delta: float) -> void:
 					is_charging = false
 					charge_time = 0.0
 
-			if ball: 
+			if ball:
 				var target_pos = dribble_pos.global_position
 				var to_target = target_pos - ball.global_position
 				ball.linear_velocity.x = to_target.x * dribble_speed
@@ -258,11 +294,18 @@ func pass_ball() -> void:
 			best_teammate = teammate
 
 	if best_teammate:
-		var pass_dir = (best_teammate.global_position - global_position).normalized()
+		# Keep the pass level and aim at the teammate's ground position.
+		var pass_dir = best_teammate.global_position - global_position
+		pass_dir.y = 0.0
+		pass_dir = pass_dir.normalized()
 		remove_collision_exception_with(ball)
 		
 		var impulse = (pass_dir * pass_force)
 		ball.apply_central_impulse(impulse)
+		# Give the passer time to move away before it can collect the ball again.
+		pickup_lockout = 0.4
+		# Save the pass direction so the receiver can face the play on contact.
+		best_teammate.receive_direction = pass_dir
 		
 		self.is_player_controlled = false
 		self.is_charging = false
@@ -273,8 +316,28 @@ func pass_ball() -> void:
 		
 		ball = null
 
+func claim_ball(target_ball: RigidBody3D) -> void:
+	# Face the pass direction when available, or the ball's travel direction.
+	var incoming_direction = receive_direction
+	if incoming_direction.length() <= 0.1:
+		incoming_direction = target_ball.linear_velocity
+	incoming_direction.y = 0.0
+	if incoming_direction.length() > 0.1:
+		look_at(global_position + incoming_direction.normalized(), Vector3.UP)
+	receive_direction = Vector3.ZERO
 
-# --- CAMBIO MANUAL DE JUGADOR ---
+	# Take possession and cancel any bounce or spin.
+	ball = target_ball
+	ball.linear_velocity = Vector3.ZERO
+	ball.angular_velocity = Vector3.ZERO
+	add_collision_exception_with(ball)
+
+	# Activate an AI teammate as soon as it receives the ball.
+	if current_state == PlayerState.WAIT_FOR_PASS or current_state == PlayerState.SUPPORT_ATTACK:
+		become_active_player()
+
+
+# Switch control to the closest teammate.
 func manual_switch() -> void:
 	var ball_nodes = get_tree().get_nodes_in_group("game_ball")
 	if ball_nodes.size() == 0:
@@ -284,9 +347,9 @@ func manual_switch() -> void:
 	var teammates = get_tree().get_nodes_in_group("team_player")
 	
 	var best_teammate = null
-	var min_dist = INF # Usamos Infinito para que cualquier distancia sea menor en la primera revisión
+	var min_dist = INF
 	
-	# Buscar al compañero (que no seas tú) que esté más cerca de la pelota
+	# Find the teammate closest to the ball.
 	for t in teammates:
 		if t == self:
 			continue
@@ -296,13 +359,13 @@ func manual_switch() -> void:
 			min_dist = dist
 			best_teammate = t
 			
-	# Si encontramos a alguien
+
 	if best_teammate:
-		# 1. Te quitas el control a ti mismo y pasas a ser IA (Apoyo)
+		# Return this player to AI support.
 		self.is_player_controlled = false
 		self.current_state = PlayerState.SUPPORT_ATTACK
 		self.is_charging = false
 		
-		# 2. Le transfieres el control absoluto al compañero elegido
+		# Give control to the selected teammate.
 		best_teammate.is_player_controlled = true
 		best_teammate.current_state = PlayerState.USER_CONTROL
